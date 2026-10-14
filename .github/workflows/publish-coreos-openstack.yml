@@ -1,0 +1,186 @@
+name: Publish Fedora CoreOS OpenStack image
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-publish even if the version is unchanged'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-coreos-openstack
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve latest stable release metadata
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          RELEASES_URL="https://builds.coreos.fedoraproject.org/prod/streams/stable/releases.json"
+          STREAM_URL="https://builds.coreos.fedoraproject.org/streams/stable.json"
+
+          if RELEASES_JSON="$(curl -fsSL --retry 3 "$RELEASES_URL")"; then
+            VERSION="$(jq -r '.releases[-1].version' <<<"$RELEASES_JSON")"
+            META_URL="$(jq -r '.releases[-1].metadata' <<<"$RELEASES_JSON")"
+            DISK_JSON="$(curl -fsSL --retry 3 "$META_URL" \
+              | jq -c '.architectures.x86_64.media.openstack.artifacts["qcow2.xz"].disk')"
+          else
+            echo "Primary releases.json unavailable; falling back to stream metadata"
+            STREAM_JSON="$(curl -fsSL --retry 3 "$STREAM_URL")"
+            VERSION="$(jq -r '.architectures.x86_64.artifacts.openstack.release' <<<"$STREAM_JSON")"
+            DISK_JSON="$(jq -c '.architectures.x86_64.artifacts.openstack.formats["qcow2.xz"].disk' <<<"$STREAM_JSON")"
+          fi
+
+          LOCATION="$(jq -r '.location' <<<"$DISK_JSON")"
+          SHA256="$(jq -r '.sha256' <<<"$DISK_JSON")"
+          UNC_SHA256="$(jq -r '."uncompressed-sha256"' <<<"$DISK_JSON")"
+          UPSTREAM_BASENAME="$(basename "$LOCATION" .xz)"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "location=$LOCATION" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "uncompressed_sha256=$UNC_SHA256" >> "$GITHUB_OUTPUT"
+          echo "upstream_basename=$UPSTREAM_BASENAME" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved Fedora CoreOS $VERSION"
+          echo "  xz                  : $LOCATION"
+          echo "  sha256 (xz)         : $SHA256"
+          echo "  sha256 (uncompressed): $UNC_SHA256"
+
+      - name: Skip if version already published
+        id: check
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          TAG="fedora-coreos-openstack"
+
+          if [[ "$FORCE" == "true" ]]; then
+            echo "Force flag set - re-publishing."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$TAG" --json title --jq '.title' 2>/dev/null | grep -qx "Fedora CoreOS $VERSION"; then
+            echo "Version $VERSION is already published; nothing to do."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and verify compressed image
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 5 \
+            -o "${{ steps.resolve.outputs.upstream_basename }}.xz" \
+            "${{ steps.resolve.outputs.location }}"
+          echo "${{ steps.resolve.outputs.sha256 }}  ${{ steps.resolve.outputs.upstream_basename }}.xz" | sha256sum -c -
+
+      - name: Extract and verify uncompressed image
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          xz -d -T0 "${{ steps.resolve.outputs.upstream_basename }}.xz"
+          echo "${{ steps.resolve.outputs.uncompressed_sha256 }}  ${{ steps.resolve.outputs.upstream_basename }}" | sha256sum -c -
+          # Stable asset name for the release
+          mv "${{ steps.resolve.outputs.upstream_basename }}" "fedora-coreos-openstack.x86_64.qcow2"
+
+      - name: Write checksum metadata
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "version=${{ steps.resolve.outputs.version }}"
+            echo "sha256=${{ steps.resolve.outputs.sha256 }}"
+            echo "uncompressed-sha256=${{ steps.resolve.outputs.uncompressed_sha256 }}"
+            echo "upstream=${{ steps.resolve.outputs.location }}"
+          } > fedora-coreos-openstack.x86_64.qcow2.sha256
+
+      - name: Publish GitHub release
+        if: steps.check.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          LOCATION: ${{ steps.resolve.outputs.location }}
+          SHA256: ${{ steps.resolve.outputs.sha256 }}
+          UNC_SHA256: ${{ steps.resolve.outputs.uncompressed_sha256 }}
+        run: |
+          set -euo pipefail
+          TAG="fedora-coreos-openstack"
+          ASSETS=(
+            fedora-coreos-openstack.x86_64.qcow2
+            fedora-coreos-openstack.x86_64.qcow2.sha256
+          )
+
+          cat > notes.md <<'EOF'
+          Fedora CoreOS **__VERSION__** (stable stream) - OpenStack qcow2, **uncompressed**.
+
+          The upstream project only publishes the xz-compressed qcow2. This release is the
+          decompressed image so the Terraform OpenStack provider can use `web_download = true`
+          (Glance imports it directly, no client-side download/extract/upload round-trip).
+
+          Assets:
+          - `fedora-coreos-openstack.x86_64.qcow2` - uncompressed qcow2 image
+          - `fedora-coreos-openstack.x86_64.qcow2.sha256` - version + checksums metadata
+
+          Checksums:
+          - sha256 (compressed upstream .xz): `__SHA256__`
+          - sha256 (uncompressed qcow2): `__UNC_SHA256__`
+
+          Upstream source: __LOCATION__
+
+          Permanent download (no login required):
+          - `https://github.com/__REPO__/releases/latest/download/fedora-coreos-openstack.x86_64.qcow2`
+          EOF
+          sed -i \
+            -e "s|__VERSION__|$VERSION|g" \
+            -e "s|__LOCATION__|$LOCATION|g" \
+            -e "s|__SHA256__|$SHA256|g" \
+            -e "s|__UNC_SHA256__|$UNC_SHA256|g" \
+            -e "s|__REPO__|$GITHUB_REPOSITORY|g" \
+            notes.md
+
+          if gh release view "$TAG" --json tagName --jq '.tagName' >/dev/null 2>&1; then
+            echo "Updating existing release '$TAG'"
+            gh release edit "$TAG" --title "Fedora CoreOS $VERSION" --notes-file notes.md
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            echo "Creating release '$TAG'"
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "Fedora CoreOS $VERSION" \
+              --notes-file notes.md
+          fi
+
+      - name: Job summary
+        if: always()
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PUBLISH: ${{ steps.check.outputs.publish }}
+        run: |
+          {
+            echo "## Fedora CoreOS OpenStack publish"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Action | \`$PUBLISH\` |"
+            echo "| Upstream | \`${{ steps.resolve.outputs.location }}\` |"
+            echo "| sha256 (xz) | \`${{ steps.resolve.outputs.sha256 }}\` |"
+            echo "| sha256 (qcow2) | \`${{ steps.resolve.outputs.uncompressed_sha256 }}\` |"
+            echo ""
+            echo "Permanent download: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/fedora-coreos-openstack.x86_64.qcow2"
+          } >> "$GITHUB_STEP_SUMMARY"
