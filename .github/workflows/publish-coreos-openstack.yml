@@ -22,6 +22,8 @@ jobs:
     name: Publish
     runs-on: ubuntu-26.04
     timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Resolve latest stable release metadata
